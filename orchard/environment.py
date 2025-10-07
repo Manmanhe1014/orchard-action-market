@@ -8,7 +8,7 @@ import random
 from enum import Enum, auto
 from orchard.algorithms import despawn_apple, despawn_apple_selfless_orchard, \
     spawn_apple, \
-    spawn_apple_selfless_orchard
+    spawn_apple_selfless_orchard, spawn_dirt
 
 """
 The Orchard environment. Includes provisions for transition actions, spawning, and despawning.
@@ -73,26 +73,41 @@ class ActionMixin:
 
 
 class Action1D(ActionMixin, Enum):
-    LEFT = (0, [0,  -1])
-    RIGHT = (1, [0,  1])
-    STAY = (2, [0,  0])
+    LEFT_APPLE = (0, [0, -1])
+    LEFT_DIRT = (1, [0, -1])
+    RIGHT_APPLE = (0, [0, 1])
+    RIGHT_DIRT = (1, [0, 1])
+    STAY = (2, [0, 0])
 
-    def __init__(self, idx, vector):
-        self._idx = idx
+    def __init__(self, action_type, vector):
+        self._action_type = action_type  # 0=apple, 1=dirt, 2=stay
         self._vector = vector
+        self._idx = len(self.__class__.__members__)  # auto-increment
+
+    @property
+    def action_type(self):
+        return self._action_type
 
 
 class Action2D(ActionMixin, Enum):
-    LEFT = (0, [0,  -1])
-    RIGHT = (1, [0,  1])
-    STAY = (2, [0,  0])
-    UP = (3, [-1,  0])
-    DOWN = (4, [1, 0])
+    LEFT_APPLE = (0, [0, -1])
+    LEFT_DIRT = (1, [0, -1])
+    RIGHT_APPLE = (0, [0, 1])
+    RIGHT_DIRT = (1, [0, 1])
+    STAY = (2, [0, 0])
+    UP_APPLE = (0, [-1, 0])
+    UP_DIRT = (1, [-1, 0])
+    DOWN_APPLE = (0, [1, 0])
+    DOWN_DIRT = (1, [1, 0])
 
-    def __init__(self, idx, vector):
-        self._idx = idx
+    def __init__(self, action_type, vector):
+        self._action_type = action_type
         self._vector = vector
+        self._idx = len(self.__class__.__members__)
 
+    @property
+    def action_type(self):
+        return self._action_type
 
 @dataclass
 class ProcessAction:
@@ -104,7 +119,14 @@ class ProcessAction:
 class ConsumeResult:
     consumed: bool
     owner_id: Optional[int] = None
+
+@dataclass
+class ConsumeAppleResult(ConsumeResult):
     apple_pos: np.ndarray = None
+
+@dataclass
+class ConsumeDirtResult(ConsumeResult):
+    dirt_pos: np.ndarray = None
 
 
 class Orchard(ABC):
@@ -116,6 +138,7 @@ class Orchard(ABC):
                  action_algo=None,
                  spawn_algo=spawn_apple,
                  despawn_algo=despawn_apple,
+                 spawn_dirt_algo=spawn_dirt,
                  s_target=0.1,
                  apple_mean_lifetime=None,
                  debug=False):
@@ -130,16 +153,19 @@ class Orchard(ABC):
         # state grids
         self.agents = np.zeros((self.width, self.length), dtype=int)
         self.apples = np.zeros((self.width, self.length), dtype=int)
+        self.dirt = np.zeros((self.width, self.length), dtype=int)
 
         # plug-ins
         self.spawn_algorithm = spawn_algo
         self.despawn_algorithm = despawn_algo
+        self.spawn_dirt_algorithm = spawn_dirt_algo
         self.action_algorithm = action_algo or self.process_action
 
         # stats
         self.total_apples = 0
         self.apples_despawned = 0
         self.total_picked = 0
+        self.total_dirt = 0
 
         # spawn/despawn rates (unchanged logic)
         self.spawn_rate = (self.n / (self.length * self.width)) * s_target
@@ -175,7 +201,7 @@ class Orchard(ABC):
             self.agents[position[0], position[1]] += 1
 
     def get_state(self):
-        return {"agents": self.agents.copy(), "apples": self.apples.copy()}
+        return {"agents": self.agents.copy(), "apples": self.apples.copy(), "dirt": self.dirt.copy()}
 
     def _init_render(self):
         from rendering import Viewer
@@ -188,99 +214,147 @@ class Orchard(ABC):
         return self.viewer.render(self, return_rgb_array=self.render_mode == "rgb_array")
 
     @abstractmethod
-    def _consume_apple(self, pos: np.ndarray) -> ConsumeResult:
+    def _consume_apple(self, pos: np.ndarray) -> ConsumeAppleResult:
         """
         Mutate self.apples to reflect consumption.
         Return owner_id if applicable, else None.
         """
 
     @abstractmethod
-    def _route_rewards(self, picker_id: int, owner_id: Optional[int]) -> np.ndarray:
-        """
-        Return (picker_reward, owner_id_to_credit_or_None).
+    def _consume_dirt(self, pos: np.ndarray) -> ConsumeDirtResult:
+        """Return owner_id if applicable, else None.
+        Mutate self.dirt to reflect consumption.
         """
 
-    def _apply_move(self, position, action_idx):
-        vec = self.available_actions.from_idx(action_idx).vector
+    @abstractmethod
+    def _route_rewards(self, picker_id: int, owner_id: Optional[int]) -> np.ndarray:
+        """Return (picker_reward, owner_id_to_credit_or_None)."""
+
+
+    def _apply_move(self, position, action_vector):
+        vec = np.asarray(action_vector, dtype=np.int8)
         new_pos = np.clip(position + vec, [0, 0], [self.width - 1, self.length - 1])
         self.agents[new_pos[0], new_pos[1]] += 1
         self.agents[position[0], position[1]] -= 1
         return new_pos
 
-    def process_action(self, agent_id: int, position: np.ndarray, action_idx: Optional[int]) -> ProcessAction:
+
+
+    def process_action(self, agent_id: int, 
+                    position: np.ndarray, 
+                    action) -> ProcessAction:
         if self.debug:
             self.state_history.append(
-                np.concatenate([self.get_state()["agents"], self.get_state()["apples"]])
-            )
+                np.concatenate([self.get_state()["agents"], self.get_state()["apples"], self.get_state()["dirt"]])
+        )
 
-        if action_idx is not None:
-            new_pos = self._apply_move(position, action_idx)
+    # Convert action index to enum if needed
+        if isinstance(action, int):
+            action = self.available_actions.from_idx(action)
+    
+    # Get the action type and vector from the enum
+        action_type = action._action_type  # This is the consume type (0=apple, 1=dirt, 2=stay)
+        action_vector = action.vector  # This is [dx, dy]
+    
+    # Apply movement
+        if not np.array_equal(action_vector, [0, 0]):
+            new_pos = self._apply_move(position, action_vector)
         else:
             new_pos = position
-
+    
         self.agents_list[agent_id].position = new_pos
 
-        # consume (subclass defines semantics)
-        c = self._consume_apple(new_pos)
+    # Consume based on action type
+        c = ConsumeResult(consumed=False)
+        if action_type == 0:  # apple action
+            c = self._consume_apple(new_pos)
+        elif action_type == 1:  # dirt action
+            c = self._consume_dirt(new_pos)
 
         reward_vector = self._route_rewards(agent_id, c)
-
-        return ProcessAction(
-            reward_vector=reward_vector,
-            picked=c.consumed
-        )
+        return ProcessAction(reward_vector=reward_vector, picked=c.consumed)
+    
 
     @abstractmethod
     def calculate_ir(self, position, action_vector, communal=True, agent_id=None):
         raise NotImplementedError
 
+
     def spawn_despawn(self):
         self.despawn_algorithm(self, self.despawn_rate)
-        self.spawn_algorithm(self, self.spawn_rate)
+        total_dirt = int(np.count_nonzero(self.dirt))
+    
+        self.spawn_algorithm(self, self.spawn_rate, total_dirt)
+    
+        self.spawn_dirt_algorithm(self, self.spawn_rate)
 
     @abstractmethod
     def get_sum_apples(self):
         raise NotImplementedError
 
-    def process_action_eval(self, agent_id: int, position: np.ndarray, action_idx: Optional[int]):
-        if action_idx is not None:
-            new_pos = self._apply_move(position, action_idx)
+    def process_action_eval(self, agent_id: int, position: np.ndarray, action):
+        # Convert action index to enum if needed
+        if isinstance(action, int):
+            action = self.available_actions.from_idx(action)
+    
+        # Get the action type and vector from the enum
+        action_type = action._action_type
+        action_vector = action.vector
+    
+        # Apply movement
+        if not np.array_equal(action_vector, [0, 0]):
+            new_pos = self._apply_move(position, action_vector)
         else:
             new_pos = position
 
         self.agents_list[agent_id].position = new_pos
 
-        # consume (subclass defines semantics)
-        self._consume_apple(new_pos)
+        # Consume based on action type (same as training)
+        if action_type == 0:  # apple action
+            self._consume_apple(new_pos)
+        elif action_type == 1:  # dirt action
+            self._consume_dirt(new_pos)
 
     def remove_apple(self, pos: np.ndarray):
         pass
 
 
 class OrchardBasic(Orchard):
-    def _consume_apple(self, pos: np.ndarray) -> ConsumeResult:
+    def _consume_apple(self, pos: np.ndarray) -> ConsumeAppleResult:
         if self.apples[pos[0], pos[1]] > 0:
             self.apples[pos[0], pos[1]] -= 1
-            return ConsumeResult(consumed=True)
-        return ConsumeResult(consumed=False)
+            return ConsumeAppleResult(consumed=True)
+        return ConsumeAppleResult(consumed=False)
 
+    def _consume_dirt(self, pos: np.ndarray) -> ConsumeDirtResult:
+        if self.dirt[pos[0], pos[1]] > 0:
+            self.dirt[pos[0], pos[1]] -= 1
+            self.total_dirt += 1  # Did you add this?
+            return ConsumeDirtResult(consumed=True)
+        return ConsumeDirtResult(consumed=False)
+        
     def _route_rewards(self, picker_id: int, c: ConsumeResult) -> np.ndarray:
         res = np.zeros(self.n)
-        if c.consumed:
-            res[picker_id] = 1
+        if not c.consumed:
+            return res
+        if isinstance(c, ConsumeAppleResult):
+            res[picker_id] = 1.0
+        elif isinstance(c, ConsumeDirtResult):
+            res[picker_id] = -1.0
         return res
 
     def calculate_ir(self, position, action_vector, communal=True, agent_id=None):
         new_position = np.clip(position + action_vector, [0, 0], self.agents.shape - np.array([1, 1]))
         agents = self.agents.copy()
         apples = self.apples.copy()
+        dirt = self.dirt.copy()  # ← ADD THIS
         agents[new_position[0], new_position[1]] += 1
         agents[position[0], position[1]] -= 1
         if apples[new_position[0], new_position[1]] > 0:
             apples[new_position[0], new_position[1]] -= 1
-            return 1, agents, apples, new_position
+            return 1, agents, apples, dirt, new_position  # ← ADD dirt
         else:
-            return 0, agents, apples, new_position
+            return 0, agents, apples, dirt, new_position  # ← ADD dirt
 
     def get_sum_apples(self):
         return np.sum(self.apples)
@@ -297,33 +371,43 @@ class OrchardWithAppleIDs(Orchard):
                  despawn_algo=despawn_apple_selfless_orchard,
                  s_target=0.1,
                  apple_mean_lifetime=None):
-        super().__init__(length, width, num_agents, agents_list, action_algo, spawn_algo, despawn_algo, s_target, apple_mean_lifetime)
+        super().__init__(length, width, num_agents, agents_list, 
+                         action_algo, spawn_algo, despawn_algo, 
+                         s_target, apple_mean_lifetime)
 
-    def _consume_apple(self, pos: np.ndarray) -> ConsumeResult:
+    def _consume_apple(self, pos: np.ndarray) -> ConsumeAppleResult:
         owner_plus1 = self.apples[pos[0], pos[1]]
         if owner_plus1 > 0:
             self.apples[pos[0], pos[1]] = 0
-            return ConsumeResult(consumed=True, owner_id=owner_plus1.item())
-        return ConsumeResult(consumed=False)
+            return ConsumeAppleResult(consumed=True, owner_id=owner_plus1.item())
+        return ConsumeAppleResult(consumed=False)
+    
+    def _consume_dirt(self, pos: np.ndarray) -> ConsumeDirtResult:
+        owner_plus1 = self.dirt[pos[0], pos[1]]
+        if owner_plus1 > 0:
+            self.dirt[pos[0], pos[1]] = 0
+            return ConsumeDirtResult(consumed=True, owner_id=owner_plus1.item())
+        return ConsumeDirtResult(consumed=False)
 
     def calculate_ir(self, position, action_vector, communal=True, agent_id=None):
         new_position = np.clip(position + action_vector, [0, 0], self.agents.shape - np.array([1, 1]))
         agents = self.agents.copy()
         apples = self.apples.copy()
+        dirt = self.dirt.copy()  # ← ADD THIS
         agents[new_position[0], new_position[1]] += 1
         agents[position[0], position[1]] -= 1
         if apples[new_position[0], new_position[1]] > 0:
             apple_id = apples[new_position[0], new_position[1]]
             apples[new_position[0], new_position[1]] = 0
             if communal or ((not communal) and (agent_id + 1) == apple_id):
-                return 1, agents, apples, new_position
+                return 1, agents, apples, dirt, new_position  # ← ADD dirt
             else:
-                return 0, agents, apples, new_position
+                return 0, agents, apples, dirt, new_position  # ← ADD dirt
         else:
-            return 0, agents, apples, new_position
+            return 0, agents, apples, dirt, new_position  # ← ADD dirt
 
     @abstractmethod
-    def _route_rewards(self, picker_id: int, c: ConsumeResult):
+    def _route_rewards(self, picker_id: int, c: ConsumeAppleResult):
         raise NotImplementedError
 
     def get_sum_apples(self):
@@ -334,81 +418,112 @@ class OrchardIDs(OrchardWithAppleIDs):
     def _route_rewards(self, picker_id: int, c: ConsumeResult):
         if not c.consumed:
             return 0, None, 0
+        if isinstance(c, ConsumeDirtResult):
+            return -1, None, 0   # picker −1, no owner
+        # existing apple logic:
+        if c.owner_id == (picker_id + 1):
+            return 0, c.owner_id, 0
         else:
-            if c.owner_id == (picker_id + 1):
-                return 0, c.owner_id, 0
-            else:
-                return 0, c.owner_id, 1  # picker=1, owner gets +1
+            return 0, c.owner_id, 1
 
 
 class OrchardMineNoReward(OrchardWithAppleIDs):
     def _route_rewards(self, picker_id: int, c: ConsumeResult):
         if not c.consumed:
             return 0, None, 0
+        if isinstance(c, ConsumeDirtResult):
+            return -1, None, 0           # ← add this
+        if c.owner_id == (picker_id + 1):
+            return 0, c.owner_id, 0
         else:
-            if c.owner_id == (picker_id + 1):
-                return 0, c.owner_id, 0
-            else:
-                return 0, c.owner_id, 1  # picker=1, owner gets +1
+            return 0, c.owner_id, 1
 
 
 class OrchardSelfless(OrchardWithAppleIDs):
     def _route_rewards(self, picker_id: int, c: ConsumeResult):
         if not c.consumed:
             return 0, None, 0
+        if isinstance(c, ConsumeDirtResult):
+            return -1, None, 0           # ← add this
+        if c.owner_id == (picker_id + 1):
+            return 1, c.owner_id, 1
         else:
-            if c.owner_id == (picker_id + 1):
-                return 1, c.owner_id, 1
-            else:
-                return 0, c.owner_id, 1  # picker=1, owner gets +1
+            return 0, c.owner_id, 1
 
 
 class OrchardMineAllRewards(OrchardWithAppleIDs):
     def _route_rewards(self, picker_id: int, c: ConsumeResult):
         if not c.consumed:
             return 0, None, 0
-        else:
-            return 1, c.owner_id, 1  # picker=1, owner gets +1
+        if isinstance(c, ConsumeDirtResult):
+            return -1, None, 0
+        return 1, c.owner_id, 1
 
 
 class OrchardEuclideanRewards(OrchardBasic):
-    def _consume_apple(self, pos: np.ndarray) -> ConsumeResult:
+    def _consume_apple(self, pos: np.ndarray) -> ConsumeAppleResult:
         if self.apples[pos[0], pos[1]] > 0:
             self.apples[pos[0], pos[1]] -= 1
-            return ConsumeResult(consumed=True, apple_pos=pos)
-        return ConsumeResult(consumed=False)
+            return ConsumeAppleResult(consumed=True, apple_pos=pos)
+        return ConsumeAppleResult(consumed=False)
 
+    def _consume_dirt(self, pos: np.ndarray) -> ConsumeDirtResult:
+        if self.dirt[pos[0], pos[1]] > 0:
+            self.dirt[pos[0], pos[1]] -= 1
+            self.total_dirt += 1 
+            return ConsumeDirtResult(consumed=True, dirt_pos=pos)
+        return ConsumeDirtResult(consumed=False)
+    
     def _route_rewards(self, picker_id: int, c: ConsumeResult) -> np.ndarray:
-        res = np.zeros(self.n)
-        if c.consumed:
-            for agent_num in range(len(self.agents_list)):
-                res[agent_num] = calc_distance(self.agents_list[agent_num].position, c.apple_pos)
-            if np.sum(res) == 0:
-                return res
-            res = res / np.sum(res)
-            res = 1 * res
-        return res
+        res = np.zeros(self.n, dtype=float)
+        if not c.consumed:
+            return res
+
+        if isinstance(c, ConsumeAppleResult):
+            # existing distance-based split
+            dists = np.array([
+                calc_distance(self.agents_list[i].position, c.apple_pos)
+                for i in range(self.n)
+            ], dtype=float)
+            s = dists.sum()
+            if s > 0:
+                res = dists / s
+            # else res stays zeros
+            return res
+
+        elif isinstance(c, ConsumeDirtResult):
+            # simple penalty to the acting agent
+            res[picker_id] = -1.0
+            return res
 
 
 class OrchardEuclideanNegativeRewards(OrchardEuclideanRewards):
     def _route_rewards(self, picker_id: int, c: ConsumeResult) -> np.ndarray:
-        res = np.zeros(self.n)
-        if c.consumed:
-            for agent_num in range(len(self.agents_list)):
-                res[agent_num] = calc_distance(self.agents_list[agent_num].position, c.apple_pos)
-            if np.sum(res) == 0:
-                return res
-            res = res / np.sum(res)
-            res = 2 * res
-            res[picker_id] = -1
-        return res
+        res = np.zeros(self.n, dtype=float)
+        if not c.consumed:
+            return res
+
+        if isinstance(c, ConsumeAppleResult):
+            dists = np.array([
+                calc_distance(self.agents_list[i].position, c.apple_pos)
+                for i in range(self.n)
+            ], dtype=float)
+            s = dists.sum()
+            if s > 0:
+                res = 2.0 * (dists / s)
+            res[picker_id] = -1.0
+            return res
+
+        elif isinstance(c, ConsumeDirtResult):
+            res[picker_id] = -1.0
+            return res
 
 
 class OrchardBasicNewDynamic(OrchardBasic):
-    def _consume_apple(self, pos: np.ndarray) -> ConsumeResult:
+    def _consume_apple(self, pos: np.ndarray) -> ConsumeAppleResult:
         if self.apples[pos[0], pos[1]] > 0:
-            return ConsumeResult(consumed=True)
-        return ConsumeResult(consumed=False)
+            return ConsumeAppleResult(consumed=True)
+        return ConsumeAppleResult(consumed=False)
 
     def remove_apple(self, pos: np.ndarray):
         if self.apples[pos[0], pos[1]] > 0:
@@ -419,38 +534,45 @@ class OrchardBasicNewDynamic(OrchardBasic):
         new_position = np.clip(position + action_vector, [0, 0], self.agents.shape - np.array([1, 1]))
         agents = self.agents.copy()
         apples = self.apples.copy()
+        dirt = self.dirt.copy()  # ← ADD THIS
         agents[new_position[0], new_position[1]] += 1
         agents[position[0], position[1]] -= 1
         if apples[new_position[0], new_position[1]] > 0:
             apple_id = apples[new_position[0], new_position[1]]
             if communal or ((not communal) and (agent_id + 1) == apple_id):
-                return 1, agents, apples, new_position
+                return 1, agents, apples, dirt, new_position  # ← ADD dirt
             else:
-                return 0, agents, apples, new_position
+                return 0, agents, apples, dirt, new_position  # ← ADD dirt
         else:
-            return 0, agents, apples, new_position
+            return 0, agents, apples, dirt, new_position  # ← ADD dirt
 
 
 class OrchardEuclideanRewardsNewDynamic(OrchardEuclideanRewards):
-    def _consume_apple(self, pos: np.ndarray) -> ConsumeResult:
+    def _consume_apple(self, pos: np.ndarray) -> ConsumeAppleResult:
         if self.apples[pos[0], pos[1]] > 0:
-            return ConsumeResult(consumed=True, apple_pos=pos)
-        return ConsumeResult(consumed=False)
+            return ConsumeAppleResult(consumed=True, apple_pos=pos)
+        return ConsumeAppleResult(consumed=False)
+    
+    def _consume_dirt(self, pos: np.ndarray) -> ConsumeDirtResult:
+        if self.dirt[pos[0], pos[1]] > 0:
+            return ConsumeDirtResult(consumed=True, dirt_pos=pos)
+        return ConsumeDirtResult(consumed=False)
 
     def calculate_ir(self, position, action_vector, communal=True, agent_id=None):
         new_position = np.clip(position + action_vector, [0, 0], self.agents.shape - np.array([1, 1]))
         agents = self.agents.copy()
         apples = self.apples.copy()
+        dirt = self.dirt.copy()
         agents[new_position[0], new_position[1]] += 1
         agents[position[0], position[1]] -= 1
         if apples[new_position[0], new_position[1]] > 0:
             apple_id = apples[new_position[0], new_position[1]]
             if communal or ((not communal) and (agent_id + 1) == apple_id):
-                return 1, agents, apples, new_position
+                return 1, agents, apples, dirt, new_position
             else:
-                return 0, agents, apples, new_position
+                return 0, agents, apples, dirt, new_position
         else:
-            return 0, agents, apples, new_position
+            return 0, agents, apples, dirt, new_position
 
     def remove_apple(self, pos: np.ndarray):
         if self.apples[pos[0], pos[1]] > 0:
@@ -459,25 +581,31 @@ class OrchardEuclideanRewardsNewDynamic(OrchardEuclideanRewards):
 
 
 class OrchardEuclideanNegativeRewardsNewDynamic(OrchardEuclideanNegativeRewards):
-    def _consume_apple(self, pos: np.ndarray) -> ConsumeResult:
+    def _consume_apple(self, pos: np.ndarray) -> ConsumeAppleResult:
         if self.apples[pos[0], pos[1]] > 0:
-            return ConsumeResult(consumed=True, apple_pos=pos)
-        return ConsumeResult(consumed=False)
+            return ConsumeAppleResult(consumed=True, apple_pos=pos)
+        return ConsumeAppleResult(consumed=False)
+    
+    def _consume_dirt(self, pos: np.ndarray) -> ConsumeDirtResult:
+        if self.dirt[pos[0], pos[1]] > 0:
+            return ConsumeDirtResult(consumed=True, dirt_pos=pos)
+        return ConsumeDirtResult(consumed=False)
 
     def calculate_ir(self, position, action_vector, communal=True, agent_id=None):
         new_position = np.clip(position + action_vector, [0, 0], self.agents.shape - np.array([1, 1]))
         agents = self.agents.copy()
         apples = self.apples.copy()
+        dirt = self.dirt.copy()  # ← ADD THIS
         agents[new_position[0], new_position[1]] += 1
         agents[position[0], position[1]] -= 1
         if apples[new_position[0], new_position[1]] > 0:
             apple_id = apples[new_position[0], new_position[1]]
             if communal or ((not communal) and (agent_id + 1) == apple_id):
-                return 1, agents, apples, new_position
+                return 1, agents, apples, dirt, new_position  # ← ADD dirt
             else:
-                return 0, agents, apples, new_position
+                return 0, agents, apples, dirt, new_position  # ← ADD dirt
         else:
-            return 0, agents, apples, new_position
+            return 0, agents, apples, dirt, new_position  # ← ADD dirt
 
     def remove_apple(self, pos: np.ndarray):
         if self.apples[pos[0], pos[1]] > 0:
