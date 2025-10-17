@@ -16,6 +16,15 @@ def get_nearest_agent_apple_distance(apple_pos, agents):
             min_distance = dist
     return min_distance
 
+def get_nearest_agent_dirt_distance(dirt_pos, agents):
+    min_distance = float('inf')
+    for agent_ in agents:
+        dist = distance(agent_.position, dirt_pos)
+        if dist < min_distance:
+            min_distance = dist
+    return min_distance
+
+
 
 def despawn_apple(env, q_despawn):
     """
@@ -35,21 +44,32 @@ def despawn_apple(env, q_despawn):
     return total_removed
 
 
-def spawn_apple(env, p_cell):
-    H, L = env.apples.shape  # ★ rows = width, cols = length
+def spawn_apple(env, p_cell, total_dirt=None):
+    H, L = env.apples.shape
+    
+    if total_dirt is None:
+        total_dirt = int(np.count_nonzero(env.dirt))
+    
+    rand_mat = np.random.rand(H, L)
+    spawn_positions = rand_mat < p_cell
+    
+    dirt_slowed_rate = max(0.0, 1 - (total_dirt / (H * L)) * 0.5)
+    num_to_spawn = int(np.floor(spawn_positions.sum() * dirt_slowed_rate))
+    
+    if num_to_spawn > 0:
+        candidate_positions = np.argwhere(spawn_positions)
+        # Randomly choose which ones actually spawn
+        chosen_indices = np.random.choice(len(candidate_positions), size=num_to_spawn, replace=False)
+        
+        for idx in chosen_indices:
+            pos = tuple(candidate_positions[idx])
+            env.apples[pos] += 1
+            mean_distances.append(get_nearest_agent_apple_distance(pos, env.agents_list))
+    
+    return num_to_spawn
 
-    rand_mat = np.random.rand(H, L)  # ★ new RNG draw, same shape
-    spawn_mask = rand_mat < p_cell
-    positions = np.argwhere(spawn_mask)
-    total_spawned = spawn_mask.sum()
-    if total_spawned > 0:
-        for position in positions:
-            mean_distances.append(get_nearest_agent_apple_distance(position, env.agents_list))
-    env.apples[spawn_mask] += 1
-    return total_spawned
 
-
-def spawn_apple_selfless_orchard(env, p_cell):
+def spawn_apple_selfless_orchard(env, p_cell, total_dirt=0):
     H, L = env.apples.shape  # rows = width, cols = length
 
     rand_mat = np.random.rand(H, L)
@@ -66,6 +86,22 @@ def spawn_apple_selfless_orchard(env, p_cell):
             mean_distances.append(get_nearest_agent_apple_distance(pos, env.agents_list))
 
     return total_spawned
+
+
+def spawn_dirt(env, p_cell):
+    H, L = env.dirt.shape  # match convention used for apples
+    
+    rand_mat = np.random.rand(H, L)
+    spawn_positions = (rand_mat < p_cell) & (env.dirt == 0)  # only spawn on empty cells
+    
+    candidate_positions = np.argwhere(spawn_positions)
+    num_to_spawn = len(candidate_positions)
+    
+    for pos in candidate_positions:
+        env.dirt[tuple(pos)] = 1  # prevent overstacking instead of += 1
+        mean_distances.append(get_nearest_agent_dirt_distance(pos, env.agents_list))
+    
+    return num_to_spawn
 
 
 def despawn_apple_selfless_orchard(env, q_despawn):
